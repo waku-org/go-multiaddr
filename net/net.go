@@ -7,8 +7,14 @@ package manet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"runtime"
+	"strings"
+
+	"git.wow.st/gmp/jni"
+	"golang.org/x/mobile/app"
 
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -389,7 +395,15 @@ func WrapPacketConn(pc net.PacketConn) (PacketConn, error) {
 func InterfaceMultiaddrs() ([]ma.Multiaddr, error) {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		return nil, err
+		if runtime.GOOS == "android" {
+			// To fix [x/mobile: Calling net.InterfaceAddrs() fails on Android SDK 30](https://github.com/golang/go/issues/40569)
+			addrs, err = getInterfaceAddrsFromAndroid()
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
 	}
 
 	maddrs := make([]ma.Multiaddr, len(addrs))
@@ -400,6 +414,65 @@ func InterfaceMultiaddrs() ([]ma.Multiaddr, error) {
 		}
 	}
 	return maddrs, nil
+}
+
+func getInterfaceAddrsFromAndroid() ([]net.Addr, error) {
+	var ifaceString string
+
+	// if use "golang.org/x/mobile/app", use app.RunOnJVM() below
+	err := app.RunOnJVM(func(vm, env, ctx uintptr) error {
+		jniEnv := jni.EnvFor(env)
+
+		// cls := jni.FindClass(jniEnv, "YOUR/PACKAGE/NAME/CLASSNAME")
+		// m := jni.GetMethodID(jniEnv, cls, "getInterfacesAsString", "()Ljava/lang/String;")
+		// n, err := jni.CallStaticObjectMethod(jniEnv, cls, m)
+
+		// above `YOUR.PACKAGE.NAME` `CLASSNAME.java` sometimes will cause strange [java.lang.ClassNotFoundException: Didn't find class on path: dexpathlist](https://stackoverflow.com/questions/22399572/java-lang-classnotfoundexception-didnt-find-class-on-path-dexpathlist)
+		// so use below `MainApplication.java` comes from `<application android:name=".MainApplication"` in `YOUR_PROJECT/android/app/src/main/AndroidManifest.xml`
+
+		appCtx := jni.Object(ctx)
+		cls := jni.GetObjectClass(jniEnv, appCtx)
+		m := jni.GetMethodID(jniEnv, cls, "getInterfacesAsString", "()Ljava/lang/String;")
+		n, err := jni.CallObjectMethod(jniEnv, appCtx, m)
+
+		if err != nil {
+			return errors.New("getInterfacesAsString Method invocation failed")
+		}
+		ifaceString = jni.GoString(jniEnv, jni.String(n))
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	var ifat []net.Addr
+	for _, iface := range strings.Split(ifaceString, "\n") {
+		// Example of the strings we're processing:
+		// wlan0 30 1500 true true false false true | fe80::2f60:2c82:4163:8389%wlan0/64 10.1.10.131/24
+		// r_rmnet_data0 21 1500 true false false false false | fe80::9318:6093:d1ad:ba7f%r_rmnet_data0/64
+		// mnet_data2 12 1500 true false false false false | fe80::3c8c:44dc:46a9:9907%rmnet_data2/64
+
+		if strings.TrimSpace(iface) == "" {
+			continue
+		}
+
+		fields := strings.Split(iface, "|")
+		if len(fields) != 2 {
+			// log.Printf("getInterfaces: unable to split %q", iface)
+			continue
+		}
+
+		addrs := strings.Trim(fields[1], " \n")
+		for _, addr := range strings.Split(addrs, " ") {
+			_, ip, err := net.ParseCIDR(addr)
+			if err == nil {
+				ifat = append(ifat, ip)
+			}
+		}
+	}
+
+	return ifat, nil
 }
 
 // AddrMatch returns the Multiaddrs that match the protocol stack on addr
